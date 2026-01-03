@@ -275,6 +275,7 @@ class Plugin:
             "color": self.settings.get("rgb_color", "#FF0000"),
             "brightness": self.settings.get("rgb_brightness", 100),
             "effect": self.settings.get("rgb_effect", "static"),
+            "speed": self.settings.get("rgb_speed", 50),
             "available": os.path.exists(ALLY_LED_PATH)
         }
 
@@ -299,6 +300,21 @@ class Plugin:
             decky.logger.error(f"Failed to set RGB brightness: {e}")
             return False
 
+    async def set_rgb_speed(self, speed: int) -> bool:
+        try:
+            speed = max(10, min(100, speed))
+            self.settings["rgb_speed"] = speed
+            await self.save_settings()
+            # Restart effect if one is running to apply new speed
+            effect = self.settings.get("rgb_effect", "static")
+            if effect not in ["static", "off"]:
+                await self._apply_rgb()
+            decky.logger.info(f"Set RGB speed to {speed}%")
+            return True
+        except Exception as e:
+            decky.logger.error(f"Failed to set RGB speed: {e}")
+            return False
+
     async def set_rgb_effect(self, effect: str) -> bool:
         try:
             self.settings["rgb_effect"] = effect
@@ -315,9 +331,31 @@ class Plugin:
             self.settings["rgb_enabled"] = enabled
             await self.save_settings()
             await self._apply_rgb()
+            # When RGB is disabled, enable MCU powersave to stop charging LED blink
+            await self._set_mcu_powersave(not enabled)
             return True
         except Exception as e:
             decky.logger.error(f"Failed to toggle RGB: {e}")
+            return False
+
+    async def _set_mcu_powersave(self, enabled: bool) -> bool:
+        """Enable/disable MCU powersave mode to control charging LED blink during sleep"""
+        try:
+            mcu_path = os.path.join(ASUS_WMI_PATH, "mcu_powersave")
+            if os.path.exists(mcu_path):
+                value = "1" if enabled else "0"
+                with open(mcu_path, 'w') as f:
+                    f.write(value)
+                decky.logger.info(f"MCU powersave {'enabled' if enabled else 'disabled'}")
+                return True
+            else:
+                decky.logger.warning("MCU powersave not available")
+                return False
+        except PermissionError:
+            decky.logger.warning("Permission denied setting MCU powersave")
+            return False
+        except Exception as e:
+            decky.logger.error(f"Failed to set MCU powersave: {e}")
             return False
 
     def _stop_effect(self):
@@ -364,6 +402,12 @@ class Plugin:
         except Exception as e:
             pass
 
+    def _get_effect_delay(self) -> float:
+        """Calculate delay based on speed setting (10-100). Higher speed = shorter delay."""
+        speed = self.settings.get("rgb_speed", 50)
+        # Map speed 10-100 to delay 0.15-0.01 seconds (inverted)
+        return 0.15 - (speed - 10) * (0.14 / 90)
+
     def _effect_pulse(self):
         color = self.settings.get("rgb_color", "#FF0000").lstrip('#')
         r = int(color[0:2], 16)
@@ -373,18 +417,20 @@ class Plugin:
         
         phase = 0.0
         while self.effect_running:
+            delay = self._get_effect_delay()
             # Sine wave for smooth breathing (0 to 1)
             factor = (math.sin(phase) + 1) / 2
             brightness = int(base_brightness * (0.1 + 0.9 * factor))
             self._set_led_color(r, g, b, brightness)
             phase += 0.1
-            time.sleep(0.05)
+            time.sleep(delay)
 
     def _effect_spectrum(self):
         base_brightness = int(self.settings.get("rgb_brightness", 100) * 255 / 100)
         
         hue = 0
         while self.effect_running:
+            delay = self._get_effect_delay()
             # HSV to RGB conversion
             h = hue / 360.0
             i = int(h * 6)
@@ -401,13 +447,14 @@ class Plugin:
             
             self._set_led_color(int(r * 255), int(g * 255), int(b * 255), base_brightness)
             hue = (hue + 2) % 360
-            time.sleep(0.05)
+            time.sleep(delay)
 
     def _effect_wave(self):
         base_brightness = int(self.settings.get("rgb_brightness", 100) * 255 / 100)
         
         offset = 0
         while self.effect_running:
+            delay = self._get_effect_delay()
             colors = []
             for zone in range(4):
                 hue = ((offset + zone * 90) % 360) / 360.0
@@ -427,7 +474,7 @@ class Plugin:
             
             self._set_led_zones(colors, base_brightness)
             offset = (offset + 3) % 360
-            time.sleep(0.03)
+            time.sleep(delay)
 
     def _effect_flash(self):
         color = self.settings.get("rgb_color", "#FF0000").lstrip('#')
@@ -438,12 +485,47 @@ class Plugin:
         
         on = True
         while self.effect_running:
+            # Flash uses longer delay (3x normal) since it's on/off
+            delay = self._get_effect_delay() * 3
             if on:
                 self._set_led_color(r, g, b, base_brightness)
             else:
                 self._set_led_color(0, 0, 0, 0)
             on = not on
-            time.sleep(0.3)
+            time.sleep(delay)
+
+    def _effect_battery(self):
+        """RGB color based on battery level - green (full) to red (empty)"""
+        base_brightness = int(self.settings.get("rgb_brightness", 100) * 255 / 100)
+        
+        while self.effect_running:
+            try:
+                # Read battery capacity
+                capacity = 50  # Default
+                capacity_path = os.path.join(BATTERY_PATH, "capacity")
+                if os.path.exists(capacity_path):
+                    with open(capacity_path, 'r') as f:
+                        capacity = int(f.read().strip())
+                
+                # Calculate color: green (100%) -> yellow (50%) -> red (0%)
+                if capacity >= 50:
+                    # Green to Yellow (100% -> 50%)
+                    ratio = (capacity - 50) / 50.0
+                    r = int(255 * (1 - ratio))
+                    g = 255
+                    b = 0
+                else:
+                    # Yellow to Red (50% -> 0%)
+                    ratio = capacity / 50.0
+                    r = 255
+                    g = int(255 * ratio)
+                    b = 0
+                
+                self._set_led_color(r, g, b, base_brightness)
+                time.sleep(5)  # Update every 5 seconds
+                
+            except Exception as e:
+                time.sleep(5)
 
     def _start_effect(self, effect: str):
         self._stop_effect()
@@ -456,6 +538,7 @@ class Plugin:
             "spectrum": self._effect_spectrum,
             "wave": self._effect_wave,
             "flash": self._effect_flash,
+            "battery": self._effect_battery,
         }
         
         effect_func = effect_map.get(effect)
@@ -531,13 +614,16 @@ class Plugin:
             
             profile = PERFORMANCE_PROFILES[profile_id]
             tdp = profile["tdp"]
+            fan_curve = profile.get("fan_curve", "balanced")
             
             await self.set_tdp(tdp)
+            await self.set_fan_mode(fan_curve)
             
             self.settings["current_profile"] = profile_id
+            self.settings["tdp_override"] = False
             await self.save_settings()
             
-            decky.logger.info(f"Applied profile: {profile['name']} ({tdp}W)")
+            decky.logger.info(f"Applied profile: {profile['name']} ({tdp}W, fan={fan_curve})")
             return True
             
         except Exception as e:
@@ -638,6 +724,9 @@ class Plugin:
                 saved_profile = self.settings.get("saved_profile", "performance")
                 await self.set_performance_profile(saved_profile)
                 
+                # Disable MCU powersave when exiting download mode (restore normal LED behavior)
+                await self._set_mcu_powersave(False)
+                
                 self.screen_off = False
             else:
                 # Save current brightness before turning off
@@ -657,6 +746,9 @@ class Plugin:
                 # Set to download/5W profile
                 await self.set_performance_profile("download")
                 
+                # Enable MCU powersave to disable charging LED blink during download mode
+                await self._set_mcu_powersave(True)
+                
                 self.screen_off = True
             
             return True
@@ -668,27 +760,74 @@ class Plugin:
     async def toggle_screen(self) -> bool:
         return await self.set_screen_state(self.screen_off)
 
+    def _find_throttle_thermal_policy(self) -> str:
+        """Find the throttle_thermal_policy sysfs path"""
+        # Check direct path first
+        direct_path = os.path.join(ASUS_WMI_PATH, "throttle_thermal_policy")
+        if os.path.exists(direct_path):
+            return direct_path
+        
+        # Check under hwmon
+        hwmon_path = os.path.join(ASUS_WMI_PATH, "hwmon")
+        if os.path.exists(hwmon_path):
+            for hwmon in os.listdir(hwmon_path):
+                policy_path = os.path.join(hwmon_path, hwmon, "throttle_thermal_policy")
+                if os.path.exists(policy_path):
+                    return policy_path
+        
+        # Check /sys/class/hwmon for asus-nb-wmi device
+        hwmon_base = "/sys/class/hwmon"
+        if os.path.exists(hwmon_base):
+            for hwmon in os.listdir(hwmon_base):
+                hwmon_dir = os.path.join(hwmon_base, hwmon)
+                name_path = os.path.join(hwmon_dir, "name")
+                if os.path.exists(name_path):
+                    try:
+                        with open(name_path, 'r') as f:
+                            if "asus" in f.read().strip().lower():
+                                policy_path = os.path.join(hwmon_dir, "throttle_thermal_policy")
+                                if os.path.exists(policy_path):
+                                    return policy_path
+                    except:
+                        pass
+        
+        return ""
+
     async def get_fan_info(self) -> dict:
         result = {
             "mode": self.settings.get("fan_mode", "auto"),
             "speed": 0,
-            "available": False
+            "available": False,
+            "policy_path": "",
+            "current_policy": -1
         }
         
         try:
-            # Check for fan control availability
+            # Find throttle_thermal_policy path
+            policy_path = self._find_throttle_thermal_policy()
+            if policy_path:
+                result["available"] = True
+                result["policy_path"] = policy_path
+                try:
+                    with open(policy_path, 'r') as f:
+                        result["current_policy"] = int(f.read().strip())
+                except:
+                    pass
+            
+            # Try to get fan speed from hwmon
             hwmon_base = "/sys/class/hwmon"
             if os.path.exists(hwmon_base):
                 for hwmon in os.listdir(hwmon_base):
                     hwmon_path = os.path.join(hwmon_base, hwmon)
                     fan_path = os.path.join(hwmon_path, "fan1_input")
-                    pwm_path = os.path.join(hwmon_path, "pwm1")
                     
                     if os.path.exists(fan_path):
-                        result["available"] = True
-                        with open(fan_path, 'r') as f:
-                            result["speed"] = int(f.read().strip())
-                        break
+                        try:
+                            with open(fan_path, 'r') as f:
+                                result["speed"] = int(f.read().strip())
+                            break
+                        except:
+                            pass
         except Exception as e:
             decky.logger.error(f"Failed to get fan info: {e}")
         
@@ -699,18 +838,102 @@ class Plugin:
             self.settings["fan_mode"] = mode
             await self.save_settings()
             
-            # Try ASUS WMI fan control
-            throttle_policy = os.path.join(ASUS_WMI_PATH, "throttle_thermal_policy")
-            if os.path.exists(throttle_policy):
-                mode_map = {"quiet": "2", "balanced": "0", "performance": "1", "max": "1", "auto": "0"}
-                with open(throttle_policy, 'w') as f:
-                    f.write(mode_map.get(mode, "0"))
-                decky.logger.info(f"Set fan mode: {mode}")
-                return True
+            # ROG Ally thermal policy values: 0=balanced, 1=silent/quiet, 2=turbo/performance
+            # Note: Values 1 and 2 are swapped compared to other ASUS laptops
+            mode_map = {"quiet": "1", "balanced": "0", "performance": "2", "auto": "0"}
+            policy_value = mode_map.get(mode, "0")
             
-            return True
+            # Find and write to throttle_thermal_policy
+            policy_path = self._find_throttle_thermal_policy()
+            if policy_path:
+                try:
+                    with open(policy_path, 'w') as f:
+                        f.write(policy_value)
+                    decky.logger.info(f"Set fan mode: {mode} (policy={policy_value}) via {policy_path}")
+                    return True
+                except PermissionError:
+                    decky.logger.warning(f"Permission denied writing to {policy_path}")
+                    # Try with subprocess as fallback
+                    try:
+                        result = subprocess.run(
+                            ["tee", policy_path],
+                            input=policy_value,
+                            capture_output=True,
+                            text=True
+                        )
+                        if result.returncode == 0:
+                            decky.logger.info(f"Set fan mode via tee: {mode} (policy={policy_value})")
+                            return True
+                    except Exception as e:
+                        decky.logger.error(f"tee fallback failed: {e}")
+                    return False
+                except Exception as e:
+                    decky.logger.error(f"Failed to write to {policy_path}: {e}")
+                    return False
+            
+            decky.logger.warning("Fan control not available - throttle_thermal_policy not found")
+            decky.logger.info(f"Checked paths: {ASUS_WMI_PATH}/throttle_thermal_policy and hwmon subdirs")
+            return False
         except Exception as e:
             decky.logger.error(f"Failed to set fan mode: {e}")
+            return False
+
+    async def get_fan_diagnostics(self) -> dict:
+        """Get diagnostic info about fan control paths for debugging"""
+        result = {
+            "asus_wmi_exists": os.path.exists(ASUS_WMI_PATH),
+            "throttle_policy_path": "",
+            "throttle_policy_value": -1,
+            "fan_boost_mode_path": "",
+            "fan_boost_mode_value": -1,
+            "fan_curve_enable_path": "",
+            "available_files": []
+        }
+        
+        try:
+            # Check direct throttle_thermal_policy
+            policy_path = os.path.join(ASUS_WMI_PATH, "throttle_thermal_policy")
+            if os.path.exists(policy_path):
+                result["throttle_policy_path"] = policy_path
+                try:
+                    with open(policy_path, 'r') as f:
+                        result["throttle_policy_value"] = int(f.read().strip())
+                except:
+                    pass
+            
+            # Check fan_boost_mode (alternative on some models)
+            boost_path = os.path.join(ASUS_WMI_PATH, "fan_boost_mode")
+            if os.path.exists(boost_path):
+                result["fan_boost_mode_path"] = boost_path
+                try:
+                    with open(boost_path, 'r') as f:
+                        result["fan_boost_mode_value"] = int(f.read().strip())
+                except:
+                    pass
+            
+            # Check fan_curve_enable
+            curve_path = os.path.join(ASUS_WMI_PATH, "fan_curve_enable")
+            if os.path.exists(curve_path):
+                result["fan_curve_enable_path"] = curve_path
+            
+            # List all files in asus-nb-wmi
+            if os.path.exists(ASUS_WMI_PATH):
+                result["available_files"] = os.listdir(ASUS_WMI_PATH)
+            
+            decky.logger.info(f"Fan diagnostics: {result}")
+        except Exception as e:
+            decky.logger.error(f"Fan diagnostics error: {e}")
+        
+        return result
+
+    async def set_tdp_override(self, enabled: bool) -> bool:
+        try:
+            self.settings["tdp_override"] = enabled
+            await self.save_settings()
+            decky.logger.info(f"TDP override {'enabled' if enabled else 'disabled'}")
+            return True
+        except Exception as e:
+            decky.logger.error(f"Failed to set TDP override: {e}")
             return False
 
     async def get_tdp_settings(self) -> dict:
@@ -718,6 +941,7 @@ class Plugin:
             "tdp": self.settings.get("custom_tdp", 15),
             "min": 5,
             "max": 30,
+            "tdp_override": self.settings.get("tdp_override", False),
             "available": os.path.exists(RYZENADJ_PATH) or os.path.exists("/sys/devices/platform/asus-nb-wmi")
         }
 
@@ -789,81 +1013,6 @@ class Plugin:
             decky.logger.error(f"Failed to set charge limit: {e}")
             return False
 
-    async def get_controller_settings(self) -> dict:
-        return {
-            "gyro_enabled": self.settings.get("gyro_enabled", True),
-            "vibration_intensity": self.settings.get("vibration_intensity", 100),
-            "available": True
-        }
-
-    async def set_gyro_enabled(self, enabled: bool) -> bool:
-        try:
-            self.settings["gyro_enabled"] = enabled
-            await self.save_settings()
-            
-            # Try to find and control gyro via hidraw or sysfs
-            # This is device-specific and may need adjustment
-            decky.logger.info(f"Gyro {'enabled' if enabled else 'disabled'}")
-            return True
-        except Exception as e:
-            decky.logger.error(f"Failed to set gyro: {e}")
-            return False
-
-    async def set_vibration_intensity(self, intensity: int) -> bool:
-        try:
-            intensity = max(0, min(100, intensity))
-            self.settings["vibration_intensity"] = intensity
-            await self.save_settings()
-            
-            # Trigger test rumble via ffmpeg/evdev if available
-            if intensity > 0:
-                await self._trigger_rumble(intensity)
-            
-            decky.logger.info(f"Set vibration intensity to {intensity}%")
-            return True
-        except Exception as e:
-            decky.logger.error(f"Failed to set vibration: {e}")
-            return False
-
-    async def _trigger_rumble(self, intensity: int) -> None:
-        try:
-            from evdev import InputDevice, ecodes
-            
-            # Find device with force feedback (Xbox 360 pad on ROG Ally)
-            input_path = "/dev/input"
-            for device_name in os.listdir(input_path):
-                if device_name.startswith("event"):
-                    device_path = os.path.join(input_path, device_name)
-                    try:
-                        dev = InputDevice(device_path)
-                        caps = dev.capabilities()
-                        
-                        # Check if device has force feedback capability
-                        if ecodes.EV_FF in caps:
-                            # Duration based on intensity
-                            duration = 0.1 + (intensity / 100) * 0.2  # 0.1 to 0.3 seconds
-                            
-                            # Trigger rumble - effect 0 is usually the default rumble
-                            dev.write(ecodes.EV_FF, 0, 1)  # Start rumble
-                            await asyncio.sleep(duration)
-                            dev.write(ecodes.EV_FF, 0, 0)  # Stop rumble
-                            
-                            decky.logger.info(f"Rumble played on {dev.name} at {intensity}%")
-                            dev.close()
-                            return
-                    except (PermissionError, OSError) as e:
-                        decky.logger.debug(f"Cannot access {device_path}: {e}")
-                        continue
-                    except Exception as e:
-                        decky.logger.debug(f"Error with {device_path}: {e}")
-                        continue
-            
-            decky.logger.debug("No force feedback device found")
-                
-        except ImportError:
-            decky.logger.debug("evdev module not available")
-        except Exception as e:
-            decky.logger.error(f"Rumble error: {e}")
 
     async def set_brightness(self, brightness: int) -> bool:
         """Set screen brightness (0-100)"""
@@ -892,4 +1041,83 @@ class Plugin:
             
         except Exception as e:
             decky.logger.error(f"Failed to set brightness: {e}")
+            return False
+
+    async def get_cpu_settings(self) -> dict:
+        """Get current SMT and CPU boost settings"""
+        smt_path = "/sys/devices/system/cpu/smt/control"
+        boost_path = "/sys/devices/system/cpu/cpufreq/boost"
+        
+        result = {
+            "smt_enabled": True,
+            "smt_available": os.path.exists(smt_path),
+            "boost_enabled": True,
+            "boost_available": os.path.exists(boost_path)
+        }
+        
+        try:
+            if os.path.exists(smt_path):
+                with open(smt_path, 'r') as f:
+                    smt_state = f.read().strip()
+                result["smt_enabled"] = smt_state == "on"
+            
+            if os.path.exists(boost_path):
+                with open(boost_path, 'r') as f:
+                    boost_state = f.read().strip()
+                result["boost_enabled"] = boost_state == "1"
+        except Exception as e:
+            decky.logger.error(f"Failed to read CPU settings: {e}")
+        
+        return result
+
+    async def set_smt_enabled(self, enabled: bool) -> bool:
+        """Enable or disable Simultaneous Multi-Threading (SMT)"""
+        try:
+            smt_path = "/sys/devices/system/cpu/smt/control"
+            
+            if not os.path.exists(smt_path):
+                decky.logger.warning("SMT control not available")
+                return False
+            
+            value = "on" if enabled else "off"
+            with open(smt_path, 'w') as f:
+                f.write(value)
+            
+            self.settings["smt_enabled"] = enabled
+            await self.save_settings()
+            
+            decky.logger.info(f"SMT {'enabled' if enabled else 'disabled'}")
+            return True
+            
+        except PermissionError:
+            decky.logger.error("Permission denied setting SMT - requires root")
+            return False
+        except Exception as e:
+            decky.logger.error(f"Failed to set SMT: {e}")
+            return False
+
+    async def set_cpu_boost_enabled(self, enabled: bool) -> bool:
+        """Enable or disable CPU boost"""
+        try:
+            boost_path = "/sys/devices/system/cpu/cpufreq/boost"
+            
+            if not os.path.exists(boost_path):
+                decky.logger.warning("CPU boost control not available")
+                return False
+            
+            value = "1" if enabled else "0"
+            with open(boost_path, 'w') as f:
+                f.write(value)
+            
+            self.settings["cpu_boost_enabled"] = enabled
+            await self.save_settings()
+            
+            decky.logger.info(f"CPU boost {'enabled' if enabled else 'disabled'}")
+            return True
+            
+        except PermissionError:
+            decky.logger.error("Permission denied setting CPU boost - requires root")
+            return False
+        except Exception as e:
+            decky.logger.error(f"Failed to set CPU boost: {e}")
             return False

@@ -17,6 +17,7 @@ import {
   DialogButton,
   showModal,
   ModalRoot,
+  ConfirmModal,
   Navigation,
 } from "@decky/ui";
 import { callable, toaster, routerHook } from "@decky/api";
@@ -49,7 +50,9 @@ const downloadModeState = new DownloadModeState();
 
 // Full-screen black overlay for download mode
 // Uses high z-index and fixed positioning to cover the entire screen
-const BlackScreenOverlay: FC<{ stateManager: DownloadModeState }> = ({ stateManager }) => {
+const BlackScreenOverlay: FC<{ stateManager: DownloadModeState }> = ({
+  stateManager,
+}) => {
   const [isVisible, setIsVisible] = useState(stateManager.isActive());
 
   useEffect(() => {
@@ -87,6 +90,7 @@ const getRgbState = callable<[], RgbState>("get_rgb_state");
 const setRgbColor = callable<[string], boolean>("set_rgb_color");
 const setRgbBrightness = callable<[number], boolean>("set_rgb_brightness");
 const setRgbEffect = callable<[string], boolean>("set_rgb_effect");
+const setRgbSpeed = callable<[number], boolean>("set_rgb_speed");
 const setRgbEnabled = callable<[boolean], boolean>("set_rgb_enabled");
 const getPerformanceProfiles = callable<[], ProfilesData>(
   "get_performance_profiles"
@@ -103,13 +107,13 @@ const setFanMode = callable<[string], boolean>("set_fan_mode");
 const getTdpSettings = callable<[], TdpSettings>("get_tdp_settings");
 const setTdp = callable<[number], boolean>("set_tdp");
 const getChargeLimit = callable<[], ChargeLimitInfo>("get_charge_limit");
-const getControllerSettings = callable<[], ControllerSettings>(
-  "get_controller_settings"
+const setTdpOverride = callable<[boolean], boolean>("set_tdp_override");
+const getCpuSettings = callable<[], CpuSettings>("get_cpu_settings");
+const setSmtEnabled = callable<[boolean], boolean>("set_smt_enabled");
+const setCpuBoostEnabled = callable<[boolean], boolean>(
+  "set_cpu_boost_enabled"
 );
-const setGyroEnabled = callable<[boolean], boolean>("set_gyro_enabled");
-const setVibrationIntensity = callable<[number], boolean>(
-  "set_vibration_intensity"
-);
+const getFanDiagnostics = callable<[], FanDiagnostics>("get_fan_diagnostics");
 
 interface DeviceInfo {
   model: string;
@@ -140,6 +144,7 @@ interface RgbState {
   color: string;
   brightness: number;
   effect: string;
+  speed: number;
   available: boolean;
 }
 
@@ -172,12 +177,25 @@ interface FanInfo {
   mode: string;
   speed: number;
   available: boolean;
+  policy_path?: string;
+  current_policy?: number;
+}
+
+interface FanDiagnostics {
+  asus_wmi_exists: boolean;
+  throttle_policy_path: string;
+  throttle_policy_value: number;
+  fan_boost_mode_path: string;
+  fan_boost_mode_value: number;
+  fan_curve_enable_path: string;
+  available_files: string[];
 }
 
 interface TdpSettings {
   tdp: number;
   min: number;
   max: number;
+  tdp_override: boolean;
   available: boolean;
 }
 
@@ -186,10 +204,11 @@ interface ChargeLimitInfo {
   available: boolean;
 }
 
-interface ControllerSettings {
-  gyro_enabled: boolean;
-  vibration_intensity: number;
-  available: boolean;
+interface CpuSettings {
+  smt_enabled: boolean;
+  smt_available: boolean;
+  boost_enabled: boolean;
+  boost_available: boolean;
 }
 
 const COLOR_PRESETS = [
@@ -209,6 +228,7 @@ const RGB_EFFECTS = [
   { data: "spectrum", label: "Spectrum" },
   { data: "wave", label: "Wave" },
   { data: "flash", label: "Flash" },
+  { data: "battery", label: "Battery Level" },
   { data: "off", label: "Off" },
 ];
 
@@ -295,114 +315,43 @@ const DeviceInfoModal: VFC<{
   closeModal: () => void;
   deviceInfo: DeviceInfo | null;
 }> = ({ closeModal, deviceInfo }) => {
-  const InfoRow: VFC<{ label: string; value: string; small?: boolean }> = ({
-    label,
-    value,
-    small,
-  }) => (
-    <div
-      style={{
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "center",
-        padding: "8px 0",
-        borderBottom: "1px solid #2a2a2a",
-      }}
-    >
-      <span style={{ color: "#8b929a", fontSize: "13px" }}>{label}</span>
-      <span
-        style={{
-          color: "#fff",
-          fontSize: small ? "11px" : "13px",
-          textAlign: "right",
-          maxWidth: "60%",
-        }}
-      >
-        {value}
-      </span>
-    </div>
-  );
-
   return (
-    <ModalRoot onCancel={closeModal} onEscKeypress={closeModal}>
-      <div style={{ padding: "24px", minWidth: "320px", textAlign: "center" }}>
-        <h1
-          style={{
-            fontSize: "24px",
-            fontWeight: "bold",
-            color: "#fff",
-            marginBottom: "8px",
-          }}
-        >
-          Device Information
-        </h1>
-        <div
-          style={{
-            fontSize: "14px",
-            color: "#1a9fff",
-            marginBottom: "20px",
-          }}
-        >
-          {deviceInfo?.model || "ROG Ally"}
-        </div>
-
-        <div
-          style={{
-            backgroundColor: "#1a1a1a",
-            borderRadius: "8px",
-            padding: "16px",
-            marginBottom: "16px",
-            textAlign: "left",
-          }}
-        >
-          <div
-            style={{
-              fontSize: "12px",
-              color: "#8b929a",
-              marginBottom: "8px",
-              textTransform: "uppercase",
-            }}
-          >
-            Hardware
-          </div>
-          <InfoRow label="CPU" value={deviceInfo?.cpu || "Unknown"} small />
-          <InfoRow label="GPU" value={deviceInfo?.gpu || "Unknown"} />
-          <InfoRow
-            label="Memory"
-            value={deviceInfo?.memory_total || "Unknown"}
-          />
-        </div>
-
-        <div
-          style={{
-            backgroundColor: "#1a1a1a",
-            borderRadius: "8px",
-            padding: "16px",
-            marginBottom: "20px",
-            textAlign: "left",
-          }}
-        >
-          <div
-            style={{
-              fontSize: "12px",
-              color: "#8b929a",
-              marginBottom: "8px",
-              textTransform: "uppercase",
-            }}
-          >
-            System
-          </div>
-          <InfoRow label="BIOS" value={deviceInfo?.bios_version || "Unknown"} />
-          <InfoRow
-            label="Kernel"
-            value={deviceInfo?.kernel || "Unknown"}
-            small
-          />
-        </div>
-
-        <DialogButton onClick={closeModal}>Close</DialogButton>
+    <ConfirmModal
+      onEscKeypress={closeModal}
+      onOK={closeModal}
+      strOKButtonText="Close"
+      bHideCloseIcon={true}
+      bAlertDialog={true}
+    >
+      <div style={{ textAlign: "center", marginBottom: "12px" }}>
+        <div style={{ fontSize: "18px", fontWeight: "bold", color: "#fff" }}>Device Information</div>
+        <div style={{ fontSize: "12px", color: "#1a9fff" }}>{deviceInfo?.model || "ROG Ally"}</div>
       </div>
-    </ModalRoot>
+      <div>
+        <div style={{ color: "#8b929a", fontSize: "11px", marginBottom: "4px" }}>HARDWARE</div>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "2px" }}>
+          <span style={{ color: "#8b929a", fontSize: "12px" }}>CPU</span>
+          <span style={{ color: "#fff", fontSize: "11px" }}>{deviceInfo?.cpu || "Unknown"}</span>
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "2px" }}>
+          <span style={{ color: "#8b929a", fontSize: "12px" }}>GPU</span>
+          <span style={{ color: "#fff", fontSize: "12px" }}>{deviceInfo?.gpu || "Unknown"}</span>
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "12px" }}>
+          <span style={{ color: "#8b929a", fontSize: "12px" }}>Memory</span>
+          <span style={{ color: "#fff", fontSize: "12px" }}>{deviceInfo?.memory_total || "Unknown"}</span>
+        </div>
+        <div style={{ color: "#8b929a", fontSize: "11px", marginBottom: "4px" }}>SYSTEM</div>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "2px" }}>
+          <span style={{ color: "#8b929a", fontSize: "12px" }}>BIOS</span>
+          <span style={{ color: "#fff", fontSize: "12px" }}>{deviceInfo?.bios_version || "Unknown"}</span>
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between" }}>
+          <span style={{ color: "#8b929a", fontSize: "12px" }}>Kernel</span>
+          <span style={{ color: "#fff", fontSize: "11px" }}>{deviceInfo?.kernel || "Unknown"}</span>
+        </div>
+      </div>
+    </ConfirmModal>
   );
 };
 
@@ -721,6 +670,18 @@ const RgbLightingSection: VFC = () => {
     }
   };
 
+  const handleSpeedChange = async (speed: number) => {
+    const success = await setRgbSpeed(speed);
+    if (success) {
+      setRgbState((prev: RgbState | null) =>
+        prev ? { ...prev, speed } : null
+      );
+    }
+  };
+
+  // Effects that support speed control
+  const animatedEffects = ["pulse", "spectrum", "wave", "flash"];
+
   if (loading) {
     return (
       <PanelSection title="RGB Lighting">
@@ -802,6 +763,20 @@ const RgbLightingSection: VFC = () => {
               onChange={handleEffectChange}
             />
           </PanelSectionRow>
+
+          {/* Speed - only show for animated effects */}
+          {animatedEffects.includes(currentEffect) && (
+            <PanelSectionRow>
+              <SliderField
+                label="Speed"
+                value={rgbState?.speed ?? 50}
+                min={10}
+                max={100}
+                step={10}
+                onChange={handleSpeedChange}
+              />
+            </PanelSectionRow>
+          )}
         </div>
       )}
     </PanelSection>
@@ -822,7 +797,7 @@ const PerformanceSection: VFC = () => {
   const [loading, setLoading] = useState(true);
   const [currentTdp, setCurrentTdp] = useState(15);
   const [currentFanMode, setCurrentFanMode] = useState("auto");
-  const [tdpOverride, setTdpOverride] = useState(false);
+  const [tdpOverride, setTdpOverrideState] = useState(false);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -837,6 +812,7 @@ const PerformanceSection: VFC = () => {
         setTdpInfo(tdp);
         setCurrentFanMode(fan.mode);
         setCurrentTdp(tdpSettings.tdp);
+        setTdpOverrideState(tdpSettings.tdp_override || false);
       } catch (e) {
         console.error("Failed to get performance data:", e);
       }
@@ -865,10 +841,15 @@ const PerformanceSection: VFC = () => {
       setProfilesData((prev: ProfilesData | null) =>
         prev ? { ...prev, current: profileId } : null
       );
-      const profileName = profilesData?.profiles[profileId]?.name || profileId;
+      const profile = profilesData?.profiles[profileId];
+      const profileName = profile?.name || profileId;
+      // Update fan mode UI to match profile's fan_curve
+      if (profile?.fan_curve) {
+        setCurrentFanMode(profile.fan_curve);
+      }
       toaster.toast({ title: "Ally Center", body: `Preset: ${profileName}` });
-      // Disable TDP override when selecting a preset
-      setTdpOverride(false);
+      // Disable TDP override when selecting a preset (backend already does this)
+      setTdpOverrideState(false);
     }
   };
 
@@ -884,7 +865,8 @@ const PerformanceSection: VFC = () => {
   };
 
   const handleTdpOverrideToggle = async (enabled: boolean) => {
-    setTdpOverride(enabled);
+    setTdpOverrideState(enabled);
+    await setTdpOverride(enabled);
     if (enabled) {
       toaster.toast({
         title: "Ally Center",
@@ -1024,76 +1006,100 @@ const PerformanceSection: VFC = () => {
   );
 };
 
-const ControllerSection: VFC = () => {
-  const [settings, setSettings] = useState<ControllerSettings | null>(null);
-  const [gyroEnabled, setGyroState] = useState(true);
-  const [vibration, setVibration] = useState(100);
+const CpuSettingsSection: VFC = () => {
+  const [cpuSettings, setCpuSettings] = useState<CpuSettings | null>(null);
+  const [smtEnabled, setSmtState] = useState(true);
+  const [boostEnabled, setBoostState] = useState(true);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const data = await getControllerSettings();
-        setSettings(data);
-        setGyroState(data.gyro_enabled);
-        setVibration(data.vibration_intensity);
+        const data = await getCpuSettings();
+        setCpuSettings(data);
+        setSmtState(data.smt_enabled);
+        setBoostState(data.boost_enabled);
       } catch (e) {
-        console.error("Failed to get controller settings:", e);
+        console.error("Failed to get CPU settings:", e);
       }
+      setLoading(false);
     };
     fetchData();
   }, []);
 
-  const handleGyroToggle = async (enabled: boolean) => {
-    setGyroState(enabled);
-    await setGyroEnabled(enabled);
-    toaster.toast({
-      title: "Ally Center",
-      body: `Gyro ${enabled ? "enabled" : "disabled"}`,
-    });
-  };
-
-  const handleVibrationChange = async (intensity: number) => {
-    setVibration(intensity);
-    await setVibrationIntensity(intensity);
-    if (intensity > 0) {
-      try {
-        const gamepads = navigator.getGamepads();
-        for (const gp of gamepads) {
-          if (gp && gp.vibrationActuator) {
-            (gp.vibrationActuator as any).playEffect("dual-rumble", {
-              duration: 100 + intensity * 2,
-              strongMagnitude: intensity / 100,
-              weakMagnitude: intensity / 100,
-            });
-          }
-        }
-      } catch (e) {
-        // Vibration not supported
-      }
+  const handleSmtToggle = async (enabled: boolean) => {
+    setSmtState(enabled);
+    const success = await setSmtEnabled(enabled);
+    if (success) {
+      toaster.toast({
+        title: "Ally Center",
+        body: `SMT ${enabled ? "enabled" : "disabled"}`,
+      });
+    } else {
+      setSmtState(!enabled);
+      toaster.toast({
+        title: "Ally Center",
+        body: "Failed to change SMT setting",
+      });
     }
   };
 
-  return (
-    <PanelSection title="Controller">
-      <PanelSectionRow>
-        <ToggleField
-          label="Gyroscope"
-          checked={gyroEnabled}
-          onChange={handleGyroToggle}
-        />
-      </PanelSectionRow>
+  const handleBoostToggle = async (enabled: boolean) => {
+    setBoostState(enabled);
+    const success = await setCpuBoostEnabled(enabled);
+    if (success) {
+      toaster.toast({
+        title: "Ally Center",
+        body: `CPU Boost ${enabled ? "enabled" : "disabled"}`,
+      });
+    } else {
+      setBoostState(!enabled);
+      toaster.toast({
+        title: "Ally Center",
+        body: "Failed to change CPU Boost setting",
+      });
+    }
+  };
 
-      <PanelSectionRow>
-        <SliderField
-          label={`Vibration: ${vibration}%`}
-          value={vibration}
-          min={0}
-          max={100}
-          step={10}
-          showValue={false}
-          onChange={handleVibrationChange}
-        />
-      </PanelSectionRow>
+  if (loading) {
+    return (
+      <PanelSection title="CPU Settings">
+        <PanelSectionRow>
+          <div style={{ color: "#8b929a" }}>Loading...</div>
+        </PanelSectionRow>
+      </PanelSection>
+    );
+  }
+
+  return (
+    <PanelSection title="CPU Settings">
+      {cpuSettings?.smt_available && (
+        <PanelSectionRow>
+          <ToggleField
+            label="SMT (Hyper-Threading)"
+            description="Disable for better single-thread performance"
+            checked={smtEnabled}
+            onChange={handleSmtToggle}
+          />
+        </PanelSectionRow>
+      )}
+
+      {cpuSettings?.boost_available && (
+        <PanelSectionRow>
+          <ToggleField
+            label="CPU Boost"
+            description="Disable to reduce heat and power usage"
+            checked={boostEnabled}
+            onChange={handleBoostToggle}
+          />
+        </PanelSectionRow>
+      )}
+
+      {!cpuSettings?.smt_available && !cpuSettings?.boost_available && (
+        <PanelSectionRow>
+          <div style={{ color: "#8b929a" }}>CPU controls not available</div>
+        </PanelSectionRow>
+      )}
     </PanelSection>
   );
 };
@@ -1101,7 +1107,9 @@ const ControllerSection: VFC = () => {
 let rgbWasEnabled = false;
 
 const DownloadModeSection: VFC = () => {
-  const [downloadMode, setDownloadMode] = useState(downloadModeState.isActive());
+  const [downloadMode, setDownloadMode] = useState(
+    downloadModeState.isActive()
+  );
 
   useEffect(() => {
     return downloadModeState.subscribe(setDownloadMode);
@@ -1132,7 +1140,10 @@ const DownloadModeSection: VFC = () => {
         await setRgbEnabled(false);
         downloadModeState.setActive(true);
         Navigation.CloseSideMenus();
-        toaster.toast({ title: "Ally Center", body: "Download Mode enabled - Open QAM to exit" });
+        toaster.toast({
+          title: "Ally Center",
+          body: "Download Mode enabled - Open QAM to exit",
+        });
       }
     } else {
       await exitDownloadMode();
@@ -1155,115 +1166,41 @@ const DownloadModeSection: VFC = () => {
 
 const AboutModal: VFC<{ closeModal: () => void }> = ({ closeModal }) => {
   return (
-    <ModalRoot onCancel={closeModal} onEscKeypress={closeModal}>
-      <div style={{ padding: "16px", minWidth: "300px", textAlign: "center" }}>
-        <h1
-          style={{
-            fontSize: "20px",
-            fontWeight: "bold",
-            color: "#fff",
-            marginBottom: "4px",
-          }}
-        >
-          Ally Center
-        </h1>
-        <div
-          style={{ fontSize: "12px", color: "#8b929a", marginBottom: "12px" }}
-        >
-          Version 1.0.0
-        </div>
-
-        <div
-          style={{
-            backgroundColor: "#1a1a1a",
-            borderRadius: "8px",
-            padding: "12px",
-            marginBottom: "10px",
-          }}
-        >
-          <div style={{ fontSize: "12px", color: "#8b929a" }}>Created by</div>
-          <div
-            style={{ fontSize: "16px", color: "#1a9fff", fontWeight: "bold" }}
-          >
-            Keith Baker
-          </div>
-          <div style={{ fontSize: "12px", color: "#8b929a" }}>
-            Pixel Addict Games
-          </div>
-        </div>
-
-        <div
-          style={{
-            backgroundColor: "#1a1a1a",
-            borderRadius: "8px",
-            padding: "12px",
-            marginBottom: "12px",
-            textAlign: "left",
-          }}
-        >
-          <div
-            style={{
-              fontSize: "10px",
-              color: "#8b929a",
-              marginBottom: "8px",
-              textTransform: "uppercase",
-            }}
-          >
-            Acknowledgments
-          </div>
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              marginBottom: "4px",
-            }}
-          >
-            <span style={{ fontSize: "11px", color: "#fff" }}>HueSync</span>
-            <span style={{ fontSize: "9px", color: "#1a9fff" }}>
-              github.com/honjow/HueSync
-            </span>
-          </div>
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              marginBottom: "4px",
-            }}
-          >
-            <span style={{ fontSize: "11px", color: "#fff" }}>
-              Decky Loader
-            </span>
-            <span style={{ fontSize: "9px", color: "#1a9fff" }}>decky.xyz</span>
-          </div>
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              marginBottom: "4px",
-            }}
-          >
-            <span style={{ fontSize: "11px", color: "#fff" }}>ASUS Linux</span>
-            <span style={{ fontSize: "9px", color: "#1a9fff" }}>
-              asus-linux.org
-            </span>
-          </div>
-          <div style={{ display: "flex", justifyContent: "space-between" }}>
-            <span style={{ fontSize: "11px", color: "#fff" }}>
-              Valve & SteamOS
-            </span>
-            <span style={{ fontSize: "9px", color: "#1a9fff" }}>
-              steampowered.com
-            </span>
-          </div>
-        </div>
-
-        <div style={{ fontSize: "10px", color: "#555", marginBottom: "12px" }}>
-          RGB lighting, battery health, performance profiles & more.
-        </div>
-
-        <DialogButton onClick={closeModal}>Close</DialogButton>
+    <ConfirmModal
+      onEscKeypress={closeModal}
+      onOK={closeModal}
+      strOKButtonText="Close"
+      bHideCloseIcon={true}
+      bAlertDialog={true}
+    >
+      <div style={{ textAlign: "center", marginBottom: "12px" }}>
+        <div style={{ fontSize: "18px", fontWeight: "bold", color: "#fff" }}>Ally Center</div>
+        <div style={{ fontSize: "12px", color: "#8b929a" }}>Version 1.1.0</div>
       </div>
-    </ModalRoot>
+      <div style={{ textAlign: "center" }}>
+        <div style={{ color: "#8b929a", fontSize: "11px" }}>Created by</div>
+        <div style={{ color: "#1a9fff", fontSize: "14px", fontWeight: "bold" }}>Keith Baker</div>
+        <div style={{ color: "#8b929a", fontSize: "11px", marginBottom: "12px" }}>Pixel Addict Games</div>
+        
+        <div style={{ color: "#8b929a", fontSize: "11px", marginBottom: "4px", textAlign: "left" }}>THANKS TO</div>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "2px" }}>
+          <span style={{ color: "#fff", fontSize: "12px" }}>HueSync</span>
+          <span style={{ color: "#8b929a", fontSize: "11px" }}>honjow</span>
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "2px" }}>
+          <span style={{ color: "#fff", fontSize: "12px" }}>Decky Loader</span>
+          <span style={{ color: "#8b929a", fontSize: "11px" }}>decky.xyz</span>
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "2px" }}>
+          <span style={{ color: "#fff", fontSize: "12px" }}>ASUS Linux</span>
+          <span style={{ color: "#8b929a", fontSize: "11px" }}>asus-linux.org</span>
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between" }}>
+          <span style={{ color: "#fff", fontSize: "12px" }}>Valve</span>
+          <span style={{ color: "#8b929a", fontSize: "11px" }}>SteamOS</span>
+        </div>
+      </div>
+    </ConfirmModal>
   );
 };
 
@@ -1288,7 +1225,7 @@ const AllyCenterContent: VFC = () => {
     <div>
       <DownloadModeSection />
       <PerformanceSection />
-      <ControllerSection />
+      <CpuSettingsSection />
       <BatteryHealthSection />
       <RgbLightingSection />
       <DeviceInfoSection />
