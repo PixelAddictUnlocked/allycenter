@@ -72,6 +72,7 @@ class Plugin:
         """Main entry point for the plugin"""
         self.settings_path = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
         await self.load_settings()
+        await self._apply_settings()
         decky.logger.info("Ally Center initialized")
 
     async def _unload(self):
@@ -114,6 +115,33 @@ class Plugin:
                 json.dump(self.settings, f, indent=2)
         except Exception as e:
             decky.logger.error(f"Failed to save settings: {e}")
+
+    async def _apply_settings(self):
+        """Restore all saved hardware settings after plugin or system restart."""
+        charge_limit = self.settings.get("charge_limit")
+        if charge_limit is not None:
+            await self.set_charge_limit(charge_limit)
+
+        if "smt_enabled" in self.settings:
+            await self.set_smt_enabled(self.settings["smt_enabled"])
+        if "cpu_boost_enabled" in self.settings:
+            await self.set_cpu_boost_enabled(self.settings["cpu_boost_enabled"])
+
+        await self._apply_rgb()
+        await self._set_mcu_powersave(not self.settings.get("rgb_enabled", True))
+
+        if not self.settings.get("use_external_tdp", False):
+            if self.settings.get("tdp_override", False):
+                if "custom_tdp" in self.settings:
+                    await self.set_tdp(self.settings["custom_tdp"])
+                if "fan_mode" in self.settings:
+                    await self.set_fan_mode(self.settings["fan_mode"])
+            elif "current_profile" in self.settings:
+                await self.set_performance_profile(self.settings["current_profile"])
+            elif "fan_mode" in self.settings:
+                await self.set_fan_mode(self.settings["fan_mode"])
+
+        decky.logger.info("Applied saved settings")
 
     async def get_settings(self) -> dict:
         return self.settings
