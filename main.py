@@ -9,6 +9,7 @@ Licensed under MIT
 import os
 import json
 import subprocess
+import signal
 import asyncio
 import threading
 import time
@@ -65,6 +66,7 @@ class Plugin:
     settings_path: str = None
     settings: dict = {}
     screen_off: bool = False
+    sleep_inhibitor: subprocess.Popen = None
     effect_thread: threading.Thread = None
     effect_running: bool = False
     
@@ -81,6 +83,8 @@ class Plugin:
         # Restore screen if it was off
         if self.screen_off:
             await self.set_screen_state(True)
+        # Always release the inhibitor, including after a partial Download Mode entry.
+        self._stop_sleep_inhibitor()
         decky.logger.info("Ally Center unloaded")
 
     async def _migration(self):
@@ -702,6 +706,85 @@ class Plugin:
         
         return 100
 
+    async def _start_sleep_inhibitor(self) -> bool:
+        """Block automatic idle handling, suspend, and hibernation."""
+        if self.sleep_inhibitor and self.sleep_inhibitor.poll() is None:
+            return True
+
+        try:
+            # Watch the backend PID so the lock self-releases if Decky or the
+            # plugin crashes instead of unloading cleanly.
+            self.sleep_inhibitor = subprocess.Popen(
+                [
+                    "/usr/bin/systemd-inhibit",
+                    "--what=idle:sleep",
+                    "--who=Ally Center",
+                    "--why=Download Mode active",
+                    "--mode=block",
+                    "/bin/sh",
+                    "-c",
+                    'while kill -0 "$1" 2>/dev/null; do sleep 2; done',
+                    "ally-center-inhibitor",
+                    str(os.getpid()),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            await asyncio.sleep(0.15)
+            if self.sleep_inhibitor.poll() is not None:
+                error = self.sleep_inhibitor.stderr.read().strip()
+                decky.logger.error(f"Failed to acquire sleep inhibitor: {error}")
+                self.sleep_inhibitor = None
+                return False
+
+            decky.logger.info("Sleep and hibernation inhibited for Download Mode")
+            return True
+        except Exception as e:
+            self.sleep_inhibitor = None
+            decky.logger.error(f"Failed to start sleep inhibitor: {e}")
+            return False
+
+    def _stop_sleep_inhibitor(self):
+        """Release the Download Mode inhibitor and its watchdog process."""
+        process = self.sleep_inhibitor
+        self.sleep_inhibitor = None
+        if not process or process.poll() is not None:
+            return
+
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            process.wait(timeout=1)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            decky.logger.warning(f"Failed to stop sleep inhibitor cleanly: {e}")
+        finally:
+            decky.logger.info("Sleep and hibernation inhibitor released")
+
+    async def get_download_mode_sleep_inhibition(self) -> bool:
+        """Return the persisted Download Mode sleep-inhibition preference."""
+        return self.settings.get("download_mode_prevent_sleep", True)
+
+    async def set_download_mode_sleep_inhibition(self, enabled: bool) -> bool:
+        """Update the preference and apply it while Download Mode is active."""
+        enabled = bool(enabled)
+
+        if self.screen_off:
+            if enabled:
+                if not await self._start_sleep_inhibitor():
+                    return False
+            else:
+                self._stop_sleep_inhibitor()
+
+        self.settings["download_mode_prevent_sleep"] = enabled
+        await self.save_settings()
+        return True
+
     async def set_screen_state(self, on: bool) -> bool:
         try:
             brightness_file = os.path.join(BACKLIGHT_PATH, "brightness")
@@ -712,6 +795,10 @@ class Plugin:
                 return False
             
             if on:
+                # Release first so a failed screen/profile restore cannot leave
+                # the system permanently inhibited.
+                self._stop_sleep_inhibitor()
+
                 # Restore brightness to saved value
                 with open(max_file, 'r') as f:
                     max_brightness = int(f.read().strip())
@@ -729,6 +816,13 @@ class Plugin:
                 
                 self.screen_off = False
             else:
+                # Acquire the optional lock before blanking the display. If the
+                # user enabled it but inhibition is unavailable, leave Download
+                # Mode off rather than failing silently.
+                if self.settings.get("download_mode_prevent_sleep", True):
+                    if not await self._start_sleep_inhibitor():
+                        return False
+
                 # Save current brightness before turning off
                 with open(brightness_file, 'r') as f:
                     current = int(f.read().strip())
@@ -754,6 +848,8 @@ class Plugin:
             return True
             
         except Exception as e:
+            if not on:
+                self._stop_sleep_inhibitor()
             decky.logger.error(f"Failed to set screen state: {e}")
             return False
 

@@ -18,6 +18,7 @@ Turn off the display for background downloads to save battery. When enabled:
 - Automatically switches to 5W power profile
 - RGB lighting disabled
 - MCU powersave enabled (stops charging LED blink)
+- Optional sleep and hibernation prevention while Download Mode is active
 - Open the Quick Access Menu to exit
 
 ### Performance

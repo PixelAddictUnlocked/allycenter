@@ -2,6 +2,12 @@
 
 All notable changes to Ally Center will be documented in this file.
 
+## Unreleased
+
+### New Features
+
+- Added an optional Download Mode toggle to prevent idle sleep, suspend, and hibernation while downloads are running
+
 ## [1.1.0] - 2026-01-03
 
 ### New Features
