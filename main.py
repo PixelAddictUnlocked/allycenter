@@ -7,6 +7,7 @@ Licensed under MIT
 """
 
 import os
+import glob
 import json
 import subprocess
 import signal
@@ -15,6 +16,7 @@ import threading
 import time
 import math
 from pathlib import Path
+from typing import Optional
 
 import decky
 
@@ -28,6 +30,28 @@ FAN_CURVE_PATH = "/sys/devices/platform/asus-nb-wmi/fan_curve_enable"
 PWM_PATH = "/sys/devices/platform/asus-nb-wmi/hwmon"
 RYZENADJ_PATH = "/usr/bin/ryzenadj"
 ALLY_CONTROLLER_PATH = "/sys/devices/platform/asus-nb-wmi"
+
+# On the Ally X the charge limit is registered by the asus_wmi battery hook on
+# the ACPI battery, NOT as an asus-nb-wmi platform attribute — the platform path
+# does not exist. Probe both, most-likely first, so a kernel change moving the
+# attribute can't silently turn this back into a no-op.
+CHARGE_LIMIT_PATTERNS = [
+    "/sys/class/power_supply/BAT*/charge_control_end_threshold",
+    os.path.join(ASUS_WMI_PATH, "charge_control_end_threshold"),
+]
+
+# Shared with ally-charge-limit.service, which reapplies the limit at boot and
+# after resume because the EC doesn't persist it. The plugin writes here too, so
+# the service doesn't revert a change made from the UI.
+CHARGE_LIMIT_STATE_FILE = "/home/deck/ally-tools/etc/charge-limit"
+
+
+def find_charge_limit_path() -> Optional[str]:
+    """Path of the writable charge-limit attribute, or None if unsupported."""
+    for pattern in CHARGE_LIMIT_PATTERNS:
+        for match in sorted(glob.glob(pattern)):
+            return match
+    return None
 
 # Preset power profiles with sensible defaults for the Z1 Extreme
 PERFORMANCE_PROFILES = {
@@ -250,28 +274,6 @@ class Plugin:
             decky.logger.error(f"Failed to get battery info: {e}")
         
         return battery
-
-    async def set_charge_limit(self, limit: int) -> bool:
-        try:
-            limit = max(60, min(100, limit))  # Clamp between 60-100%
-            
-            # Try ASUS WMI charge limit
-            charge_limit_path = os.path.join(ASUS_WMI_PATH, "charge_control_end_threshold")
-            if os.path.exists(charge_limit_path):
-                with open(charge_limit_path, 'w') as f:
-                    f.write(str(limit))
-                
-                self.settings["charge_limit"] = limit
-                await self.save_settings()
-                decky.logger.info(f"Set charge limit to {limit}%")
-                return True
-            else:
-                decky.logger.warning("Charge limit control not available")
-                return False
-                
-        except Exception as e:
-            decky.logger.error(f"Failed to set charge limit: {e}")
-            return False
 
     async def get_rgb_state(self) -> dict:
         return {
@@ -1097,25 +1099,63 @@ class Plugin:
             return False
 
     async def get_charge_limit(self) -> dict:
+        charge_path = find_charge_limit_path()
+        limit = self.settings.get("charge_limit", 100)
+
+        # Prefer the live value: the systemd unit (or a previous session) may
+        # have set a limit this plugin's settings don't know about, and showing
+        # a stale number is how the UI ends up lying about the battery.
+        if charge_path:
+            try:
+                with open(charge_path, 'r') as f:
+                    live = int(f.read().strip())
+                # The driver reports 0 when no limit has been applied.
+                limit = live if live > 0 else 100
+            except Exception as e:
+                decky.logger.warning(f"Could not read {charge_path}: {e}")
+
         return {
-            "limit": self.settings.get("charge_limit", 100),
-            "available": os.path.exists(os.path.join(ASUS_WMI_PATH, "charge_control_end_threshold"))
+            "limit": limit,
+            "available": charge_path is not None
         }
+
+    def _persist_charge_limit(self, limit: int) -> None:
+        """Keep ally-charge-limit.service in sync.
+
+        That unit reapplies the stored value at boot and after every resume, so
+        without this the plugin's change silently reverts on the next suspend.
+        """
+        try:
+            os.makedirs(os.path.dirname(CHARGE_LIMIT_STATE_FILE), exist_ok=True)
+            with open(CHARGE_LIMIT_STATE_FILE, 'w') as f:
+                f.write(f"{limit}\n")
+        except Exception as e:
+            decky.logger.warning(f"Could not update {CHARGE_LIMIT_STATE_FILE}: {e}")
 
     async def set_charge_limit(self, limit: int) -> bool:
         try:
             limit = max(60, min(100, limit))
+
+            charge_path = find_charge_limit_path()
+            if charge_path is None:
+                decky.logger.warning("Charge limit control not available")
+                return False
+
+            with open(charge_path, 'w') as f:
+                f.write(str(limit))
+
+            # Read back — a write that doesn't stick must not report success.
+            with open(charge_path, 'r') as f:
+                actual = f.read().strip()
+            if actual != str(limit):
+                decky.logger.error(
+                    f"Wrote {limit} to {charge_path} but it reads back {actual}")
+                return False
+
             self.settings["charge_limit"] = limit
             await self.save_settings()
-            
-            # ASUS WMI charge limit
-            charge_path = os.path.join(ASUS_WMI_PATH, "charge_control_end_threshold")
-            if os.path.exists(charge_path):
-                with open(charge_path, 'w') as f:
-                    f.write(str(limit))
-                decky.logger.info(f"Set charge limit to {limit}%")
-                return True
-            
+            self._persist_charge_limit(limit)
+            decky.logger.info(f"Set charge limit to {limit}% ({charge_path})")
             return True
         except Exception as e:
             decky.logger.error(f"Failed to set charge limit: {e}")
