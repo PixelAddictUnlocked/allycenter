@@ -7,13 +7,16 @@ Licensed under MIT
 """
 
 import os
+import glob
 import json
 import subprocess
+import signal
 import asyncio
 import threading
 import time
 import math
 from pathlib import Path
+from typing import Optional
 
 import decky
 
@@ -27,6 +30,28 @@ FAN_CURVE_PATH = "/sys/devices/platform/asus-nb-wmi/fan_curve_enable"
 PWM_PATH = "/sys/devices/platform/asus-nb-wmi/hwmon"
 RYZENADJ_PATH = "/usr/bin/ryzenadj"
 ALLY_CONTROLLER_PATH = "/sys/devices/platform/asus-nb-wmi"
+
+# On the Ally X the charge limit is registered by the asus_wmi battery hook on
+# the ACPI battery, NOT as an asus-nb-wmi platform attribute — the platform path
+# does not exist. Probe both, most-likely first, so a kernel change moving the
+# attribute can't silently turn this back into a no-op.
+CHARGE_LIMIT_PATTERNS = [
+    "/sys/class/power_supply/BAT*/charge_control_end_threshold",
+    os.path.join(ASUS_WMI_PATH, "charge_control_end_threshold"),
+]
+
+# Shared with ally-charge-limit.service, which reapplies the limit at boot and
+# after resume because the EC doesn't persist it. The plugin writes here too, so
+# the service doesn't revert a change made from the UI.
+CHARGE_LIMIT_STATE_FILE = "/home/deck/ally-tools/etc/charge-limit"
+
+
+def find_charge_limit_path() -> Optional[str]:
+    """Path of the writable charge-limit attribute, or None if unsupported."""
+    for pattern in CHARGE_LIMIT_PATTERNS:
+        for match in sorted(glob.glob(pattern)):
+            return match
+    return None
 
 # Preset power profiles with sensible defaults for the Z1 Extreme
 PERFORMANCE_PROFILES = {
@@ -65,6 +90,7 @@ class Plugin:
     settings_path: str = None
     settings: dict = {}
     screen_off: bool = False
+    sleep_inhibitor: subprocess.Popen = None
     effect_thread: threading.Thread = None
     effect_running: bool = False
     
@@ -81,6 +107,8 @@ class Plugin:
         # Restore screen if it was off
         if self.screen_off:
             await self.set_screen_state(True)
+        # Always release the inhibitor, including after a partial Download Mode entry.
+        self._stop_sleep_inhibitor()
         decky.logger.info("Ally Center unloaded")
 
     async def _migration(self):
@@ -246,28 +274,6 @@ class Plugin:
             decky.logger.error(f"Failed to get battery info: {e}")
         
         return battery
-
-    async def set_charge_limit(self, limit: int) -> bool:
-        try:
-            limit = max(60, min(100, limit))  # Clamp between 60-100%
-            
-            # Try ASUS WMI charge limit
-            charge_limit_path = os.path.join(ASUS_WMI_PATH, "charge_control_end_threshold")
-            if os.path.exists(charge_limit_path):
-                with open(charge_limit_path, 'w') as f:
-                    f.write(str(limit))
-                
-                self.settings["charge_limit"] = limit
-                await self.save_settings()
-                decky.logger.info(f"Set charge limit to {limit}%")
-                return True
-            else:
-                decky.logger.warning("Charge limit control not available")
-                return False
-                
-        except Exception as e:
-            decky.logger.error(f"Failed to set charge limit: {e}")
-            return False
 
     async def get_rgb_state(self) -> dict:
         return {
@@ -702,6 +708,85 @@ class Plugin:
         
         return 100
 
+    async def _start_sleep_inhibitor(self) -> bool:
+        """Block automatic idle handling, suspend, and hibernation."""
+        if self.sleep_inhibitor and self.sleep_inhibitor.poll() is None:
+            return True
+
+        try:
+            # Watch the backend PID so the lock self-releases if Decky or the
+            # plugin crashes instead of unloading cleanly.
+            self.sleep_inhibitor = subprocess.Popen(
+                [
+                    "/usr/bin/systemd-inhibit",
+                    "--what=idle:sleep",
+                    "--who=Ally Center",
+                    "--why=Download Mode active",
+                    "--mode=block",
+                    "/bin/sh",
+                    "-c",
+                    'while kill -0 "$1" 2>/dev/null; do sleep 2; done',
+                    "ally-center-inhibitor",
+                    str(os.getpid()),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            await asyncio.sleep(0.15)
+            if self.sleep_inhibitor.poll() is not None:
+                error = self.sleep_inhibitor.stderr.read().strip()
+                decky.logger.error(f"Failed to acquire sleep inhibitor: {error}")
+                self.sleep_inhibitor = None
+                return False
+
+            decky.logger.info("Sleep and hibernation inhibited for Download Mode")
+            return True
+        except Exception as e:
+            self.sleep_inhibitor = None
+            decky.logger.error(f"Failed to start sleep inhibitor: {e}")
+            return False
+
+    def _stop_sleep_inhibitor(self):
+        """Release the Download Mode inhibitor and its watchdog process."""
+        process = self.sleep_inhibitor
+        self.sleep_inhibitor = None
+        if not process or process.poll() is not None:
+            return
+
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            process.wait(timeout=1)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            decky.logger.warning(f"Failed to stop sleep inhibitor cleanly: {e}")
+        finally:
+            decky.logger.info("Sleep and hibernation inhibitor released")
+
+    async def get_download_mode_sleep_inhibition(self) -> bool:
+        """Return the persisted Download Mode sleep-inhibition preference."""
+        return self.settings.get("download_mode_prevent_sleep", True)
+
+    async def set_download_mode_sleep_inhibition(self, enabled: bool) -> bool:
+        """Update the preference and apply it while Download Mode is active."""
+        enabled = bool(enabled)
+
+        if self.screen_off:
+            if enabled:
+                if not await self._start_sleep_inhibitor():
+                    return False
+            else:
+                self._stop_sleep_inhibitor()
+
+        self.settings["download_mode_prevent_sleep"] = enabled
+        await self.save_settings()
+        return True
+
     async def set_screen_state(self, on: bool) -> bool:
         try:
             brightness_file = os.path.join(BACKLIGHT_PATH, "brightness")
@@ -712,6 +797,10 @@ class Plugin:
                 return False
             
             if on:
+                # Release first so a failed screen/profile restore cannot leave
+                # the system permanently inhibited.
+                self._stop_sleep_inhibitor()
+
                 # Restore brightness to saved value
                 with open(max_file, 'r') as f:
                     max_brightness = int(f.read().strip())
@@ -729,6 +818,13 @@ class Plugin:
                 
                 self.screen_off = False
             else:
+                # Acquire the optional lock before blanking the display. If the
+                # user enabled it but inhibition is unavailable, leave Download
+                # Mode off rather than failing silently.
+                if self.settings.get("download_mode_prevent_sleep", True):
+                    if not await self._start_sleep_inhibitor():
+                        return False
+
                 # Save current brightness before turning off
                 with open(brightness_file, 'r') as f:
                     current = int(f.read().strip())
@@ -754,6 +850,8 @@ class Plugin:
             return True
             
         except Exception as e:
+            if not on:
+                self._stop_sleep_inhibitor()
             decky.logger.error(f"Failed to set screen state: {e}")
             return False
 
@@ -1001,25 +1099,63 @@ class Plugin:
             return False
 
     async def get_charge_limit(self) -> dict:
+        charge_path = find_charge_limit_path()
+        limit = self.settings.get("charge_limit", 100)
+
+        # Prefer the live value: the systemd unit (or a previous session) may
+        # have set a limit this plugin's settings don't know about, and showing
+        # a stale number is how the UI ends up lying about the battery.
+        if charge_path:
+            try:
+                with open(charge_path, 'r') as f:
+                    live = int(f.read().strip())
+                # The driver reports 0 when no limit has been applied.
+                limit = live if live > 0 else 100
+            except Exception as e:
+                decky.logger.warning(f"Could not read {charge_path}: {e}")
+
         return {
-            "limit": self.settings.get("charge_limit", 100),
-            "available": os.path.exists(os.path.join(ASUS_WMI_PATH, "charge_control_end_threshold"))
+            "limit": limit,
+            "available": charge_path is not None
         }
+
+    def _persist_charge_limit(self, limit: int) -> None:
+        """Keep ally-charge-limit.service in sync.
+
+        That unit reapplies the stored value at boot and after every resume, so
+        without this the plugin's change silently reverts on the next suspend.
+        """
+        try:
+            os.makedirs(os.path.dirname(CHARGE_LIMIT_STATE_FILE), exist_ok=True)
+            with open(CHARGE_LIMIT_STATE_FILE, 'w') as f:
+                f.write(f"{limit}\n")
+        except Exception as e:
+            decky.logger.warning(f"Could not update {CHARGE_LIMIT_STATE_FILE}: {e}")
 
     async def set_charge_limit(self, limit: int) -> bool:
         try:
             limit = max(60, min(100, limit))
+
+            charge_path = find_charge_limit_path()
+            if charge_path is None:
+                decky.logger.warning("Charge limit control not available")
+                return False
+
+            with open(charge_path, 'w') as f:
+                f.write(str(limit))
+
+            # Read back — a write that doesn't stick must not report success.
+            with open(charge_path, 'r') as f:
+                actual = f.read().strip()
+            if actual != str(limit):
+                decky.logger.error(
+                    f"Wrote {limit} to {charge_path} but it reads back {actual}")
+                return False
+
             self.settings["charge_limit"] = limit
             await self.save_settings()
-            
-            # ASUS WMI charge limit
-            charge_path = os.path.join(ASUS_WMI_PATH, "charge_control_end_threshold")
-            if os.path.exists(charge_path):
-                with open(charge_path, 'w') as f:
-                    f.write(str(limit))
-                decky.logger.info(f"Set charge limit to {limit}%")
-                return True
-            
+            self._persist_charge_limit(limit)
+            decky.logger.info(f"Set charge limit to {limit}% ({charge_path})")
             return True
         except Exception as e:
             decky.logger.error(f"Failed to set charge limit: {e}")

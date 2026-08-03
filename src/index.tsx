@@ -101,6 +101,12 @@ const setPerformanceProfile = callable<[string], boolean>(
 const getCurrentTdp = callable<[], TdpInfo>("get_current_tdp");
 const getScreenState = callable<[], ScreenState>("get_screen_state");
 const setScreenState = callable<[boolean], boolean>("set_screen_state");
+const getDownloadModeSleepInhibition = callable<[], boolean>(
+  "get_download_mode_sleep_inhibition"
+);
+const setDownloadModeSleepInhibition = callable<[boolean], boolean>(
+  "set_download_mode_sleep_inhibition"
+);
 const toggleScreen = callable<[], boolean>("toggle_screen");
 const getFanInfo = callable<[], FanInfo>("get_fan_info");
 const setFanMode = callable<[string], boolean>("set_fan_mode");
@@ -1145,10 +1151,33 @@ const DownloadModeSection: VFC = () => {
   const [downloadMode, setDownloadMode] = useState(
     downloadModeState.isActive()
   );
+  const [preventSleep, setPreventSleep] = useState(true);
 
   useEffect(() => {
-    return downloadModeState.subscribe(setDownloadMode);
+    const unsubscribe = downloadModeState.subscribe(setDownloadMode);
+    getDownloadModeSleepInhibition()
+      .then(setPreventSleep)
+      .catch(() => setPreventSleep(true));
+    return unsubscribe;
   }, []);
+
+  const handlePreventSleepToggle = async (enabled: boolean) => {
+    const success = await setDownloadModeSleepInhibition(enabled);
+    if (success) {
+      setPreventSleep(enabled);
+      toaster.toast({
+        title: "Ally Center",
+        body: enabled
+          ? "Sleep and hibernation prevention enabled"
+          : "Sleep and hibernation prevention disabled",
+      });
+    } else {
+      toaster.toast({
+        title: "Ally Center",
+        body: "Failed to change sleep prevention setting",
+      });
+    }
+  };
 
   const exitDownloadMode = async () => {
     const success = await setScreenState(true);
@@ -1193,6 +1222,15 @@ const DownloadModeSection: VFC = () => {
           description="Black screen + 5W + RGB off"
           checked={downloadMode}
           onChange={handleToggle}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ToggleField
+          label="Prevent Sleep & Hibernation"
+          description="Keep downloads running while Download Mode is active"
+          checked={preventSleep}
+          disabled={!downloadMode}
+          onChange={handlePreventSleepToggle}
         />
       </PanelSectionRow>
     </PanelSection>

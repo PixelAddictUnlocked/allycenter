@@ -2,6 +2,19 @@
 
 All notable changes to Ally Center will be documented in this file.
 
+## Unreleased
+
+### New Features
+
+- Added an optional Download Mode toggle to prevent idle sleep, suspend, and hibernation while downloads are running
+
+### Bug Fixes
+
+- Fixed the Charge Limit slider, which silently did nothing on the ROG Ally X — it wrote to an `asus-nb-wmi` platform path that does not exist on the device, skipped the write, and reported success anyway
+- Charge Limit now writes to the real attribute (`/sys/class/power_supply/BAT*/charge_control_end_threshold`, registered by the `asus_wmi` battery hook), reads it back to confirm it stuck, and reports the control as unavailable when no attribute is present
+- Charge Limit now displays the live value from the hardware instead of a possibly stale saved setting
+- Removed a duplicate `set_charge_limit` definition that silently shadowed the first
+
 ## [1.1.0] - 2026-01-03
 
 ### New Features
